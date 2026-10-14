@@ -1,0 +1,103 @@
+name: Vigia do CRM
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # confere o CRM
+    - cron: "17 9 1 * *"    # batimento mensal (mantém o robô ligado)
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "Endereço a testar (vazio = produção). Use um endereço quebrado para testar o alerta."
+        required: false
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: vigia
+  cancel-in-progress: false
+
+env:
+  URL: ${{ github.event.inputs.url || 'https://crm.85.209.92.51.sslip.io/api/v1/health' }}
+  AVISAR: suporte@handtechudi.com.br
+
+jobs:
+  batimento:
+    if: github.event.schedule == '17 9 1 * *'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          date -u +%FT%TZ > batimento.txt
+          git config user.name "vigia"
+          git config user.email "vigia@users.noreply.github.com"
+          git add batimento.txt
+          git commit -m "batimento mensal"
+          git push
+
+  conferir:
+    if: github.event.schedule != '17 9 1 * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Conferir o CRM
+        id: teste
+        run: |
+          ok=0
+          for tentativa in 1 2; do
+            corpo=$(curl -s -m 20 "$URL" || true)
+            if echo "$corpo" | grep -q '"status":"healthy"'; then ok=1; break; fi
+            echo "tentativa $tentativa falhou: ${corpo:0:300}"
+            [ $tentativa = 1 ] && sleep 45
+          done
+          echo "ok=$ok" >> "$GITHUB_OUTPUT"
+          echo "detalhe=$(echo "${corpo:-sem resposta}" | head -c 300 | tr -d '\n\r')" >> "$GITHUB_OUTPUT"
+
+      - name: Abrir ou fechar o alerta
+        id: alerta
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OK: ${{ steps.teste.outputs.ok }}
+        run: |
+          aberto=$(gh issue list -R "$GITHUB_REPOSITORY" --state open --label fora-do-ar --json number --jq '.[0].number // empty')
+          agora=$(TZ=America/Sao_Paulo date '+%d/%m %H:%M')
+          if [ "$OK" = 0 ] && [ -z "$aberto" ]; then
+            gh label create fora-do-ar -R "$GITHUB_REPOSITORY" --color B60205 2>/dev/null || true
+            gh issue create -R "$GITHUB_REPOSITORY" --label fora-do-ar \
+              --title "CRM fora do ar desde $agora" \
+              --body "O vigia não conseguiu confirmar o CRM em 2 tentativas seguidas ($agora, horário de Brasília). Este alerta fecha sozinho quando ele voltar."
+            echo "enviar=caiu" >> "$GITHUB_OUTPUT"
+          elif [ "$OK" = 1 ] && [ -n "$aberto" ]; then
+            gh issue close "$aberto" -R "$GITHUB_REPOSITORY" --comment "Voltou às $agora (horário de Brasília)."
+            echo "enviar=voltou" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Mandar e-mail
+        if: steps.alerta.outputs.enviar != ''
+        env:
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          TIPO: ${{ steps.alerta.outputs.enviar }}
+          DETALHE: ${{ steps.teste.outputs.detalhe }}
+        run: |
+          python3 - <<'PY'
+          import os, smtplib, ssl
+          from email.message import EmailMessage
+          from datetime import datetime, timezone, timedelta
+          agora = datetime.now(timezone(timedelta(hours=-3))).strftime("%d/%m %H:%M")
+          caiu = os.environ["TIPO"] == "caiu"
+          m = EmailMessage()
+          m["From"] = f"Vigia Hand One <{os.environ['SMTP_USERNAME']}>"
+          m["To"] = os.environ["AVISAR"]
+          m["Subject"] = ("🔴 CRM Hand One FORA DO AR" if caiu else "🟢 CRM Hand One voltou") + f" — {agora}"
+          corpo = (f"O vigia não conseguiu confirmar o CRM em 2 tentativas seguidas ({agora}, Brasília).\n\n"
+                   f"Endereço testado: {os.environ['URL']}\nResposta: {os.environ['DETALHE']}\n\n"
+                   "O que fazer: nota 'Plano de recuperação de desastre' no cofre (12 Segurança).\n"
+                   if caiu else f"O CRM voltou a responder normalmente às {agora} (Brasília).\n")
+          m.set_content(corpo + f"\nAlertas: https://github.com/{os.environ['GITHUB_REPOSITORY']}/issues\n")
+          with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ssl.create_default_context()) as s:
+              s.login(os.environ["SMTP_USERNAME"], os.environ["SMTP_PASSWORD"])
+              s.send_message(m)
+          print("e-mail enviado:", m["Subject"])
+          PY
