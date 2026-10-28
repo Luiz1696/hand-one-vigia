@@ -19,7 +19,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  URL: ${{ github.event.inputs.url || 'https://crm.85.209.92.51.sslip.io/api/v1/health' }}
+  URL: ${{ github.event.inputs.url || 'https://plataforma.handtechudi.com.br/api/v1/health' }}
   AVISAR: suporte@handtechudi.com.br
 
 jobs:
